@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+#
+# claude-switch — switch Claude Code between the Z.ai GLM API and a Claude subscription.
+#
+# How it works
+#   GLM mode:    the Z.ai env block (official template) lives in ~/.claude/settings.json,
+#                and the four Z.ai MCP servers are registered (user scope).
+#   Claude mode: those env keys are removed, so Claude Code falls back to your subscription login,
+#                and the Z.ai MCP servers are unregistered.
+#   Your GLM block and MCP server definitions (including keys) are saved to private files, so
+#   switching back restores them exactly. Every other key in settings.json is left untouched,
+#   each settings change is backed up first, and MCP changes go through the `claude mcp` CLI.
+#
+# Usage
+#   claude-switch glm    [--new-key] [--force] [--no-mcp]
+#   claude-switch claude [--force] [--no-mcp]
+#   claude-switch status
+#
+# Requires: bash, jq (and the `claude` CLI for the MCP part)
+
+set -euo pipefail
+umask 077
+
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+SETTINGS="$CLAUDE_DIR/settings.json"
+CLAUDE_JSON="${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/.claude.json}"
+CLAUDE_JSON="${CLAUDE_JSON:-$HOME/.claude.json}"
+STORE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-switch"
+PROFILE="$STORE_DIR/glm-env.json"
+MCP_STORE="$STORE_DIR/mcp-servers.json"
+BACKUP_DIR="$STORE_DIR/backups"
+KEEP_BACKUPS=10
+
+# The env keys that make up the GLM setup (Z.ai's official Claude Code template).
+GLM_KEYS=(
+  ANTHROPIC_AUTH_TOKEN
+  ANTHROPIC_BASE_URL
+  ANTHROPIC_DEFAULT_HAIKU_MODEL
+  ANTHROPIC_DEFAULT_SONNET_MODEL
+  ANTHROPIC_DEFAULT_OPUS_MODEL
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  API_TIMEOUT_MS
+)
+
+# The Z.ai MCP servers managed by this script (user scope).
+MCP_NAMES=(web-search-prime web-reader zread zai-mcp-server)
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+warn() { echo "warning: $*" >&2; }
+
+command -v jq >/dev/null 2>&1 || die "jq is required (e.g. apt install jq / dnf install jq)"
+
+KEYS_JSON=$(printf '%s\n' "${GLM_KEYS[@]}" | jq -R . | jq -sc .)
+
+usage() {
+  cat <<'EOF'
+Usage:
+  claude-switch glm [--new-key] [--force] [--no-mcp]   Use the Z.ai GLM API (+ Z.ai MCP servers)
+  claude-switch claude [--force] [--no-mcp]            Use your Claude subscription (removes Z.ai MCP servers)
+  claude-switch status                                 Show the current mode
+
+Options:
+  --new-key   Re-enter the Z.ai API key (otherwise the saved/ZAI_API_KEY/prompted key is used)
+  --force     Also act when settings.json points at a non-Z.ai base URL
+  --no-mcp    Leave the MCP servers exactly as they are
+
+Restart any running Claude Code session after switching.
+EOF
+}
+
+# ---------- settings.json helpers ----------
+
+ensure_settings() {
+  mkdir -p "$CLAUDE_DIR"
+  [[ -f "$SETTINGS" ]] || echo '{}' > "$SETTINGS"
+  jq empty "$SETTINGS" 2>/dev/null || die "$SETTINGS is not valid JSON; fix it first"
+}
+
+# Reads new settings JSON on stdin, validates, then atomically replaces settings.json.
+write_settings() {
+  local tmp
+  tmp=$(mktemp "$SETTINGS.XXXXXX")
+  cat > "$tmp"
+  if [[ ! -s "$tmp" ]] || ! jq empty "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die "refusing to write invalid/empty settings; $SETTINGS left unchanged"
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$SETTINGS"
+}
+
+backup_settings() {
+  mkdir -p "$BACKUP_DIR"
+  chmod 700 "$STORE_DIR" "$BACKUP_DIR"
+  local dest="$BACKUP_DIR/settings.$(date +%Y%m%d-%H%M%S).json"
+  cp -p "$SETTINGS" "$dest"
+  ls -1t "$BACKUP_DIR"/settings.*.json 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) \
+    | while read -r f; do rm -f -- "$f"; done || true
+}
+
+# Prints: glm | claude | custom
+current_mode() {
+  local base
+  base=$(jq -r '.env.ANTHROPIC_BASE_URL // ""' "$SETTINGS")
+  if [[ "$base" == *api.z.ai* ]]; then echo glm
+  elif [[ -n "$base" ]]; then echo custom
+  else echo claude
+  fi
+}
+
+save_profile_from_settings() {
+  mkdir -p "$STORE_DIR"; chmod 700 "$STORE_DIR"
+  jq --argjson keys "$KEYS_JSON" \
+    '(.env // {}) | with_entries(select(.key as $k | $keys | index($k)))' "$SETTINGS" > "$PROFILE.tmp"
+  chmod 600 "$PROFILE.tmp"; mv "$PROFILE.tmp" "$PROFILE"
+  info "Saved GLM profile to $PROFILE"
+}
+
+warn_shell_env() {
+  local v
+  for v in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL \
+           ANTHROPIC_DEFAULT_HAIKU_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL; do
+    if [[ -n "${!v:-}" ]]; then
+      warn "$v is set in your current shell environment and can conflict with this setting (check ~/.bashrc, ~/.zshrc, ~/.profile)"
+    fi
+  done
+  return 0
+}
+
+remind_restart() {
+  if pgrep -x claude >/dev/null 2>&1; then
+    info "Claude Code appears to be running. Restart it for the change to take effect."
+  else
+    info "Start a new Claude Code session for the change to take effect."
+  fi
+}
+
+build_default_profile() {
+  local key="$1"
+  # Z.ai's official manual-configuration template, unchanged.
+  jq -n --arg key "$key" '{
+    ANTHROPIC_AUTH_TOKEN: $key,
+    ANTHROPIC_BASE_URL: "https://api.z.ai/api/anthropic",
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: "glm-5.3-flash[1m]",
+    ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.3[1m]",
+    ANTHROPIC_DEFAULT_OPUS_MODEL: "glm-5.3[1m]",
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW: "1000000",
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: 1,
+    API_TIMEOUT_MS: "3000000"
+  }'
+}
+
+read_key() {
+  local key="${ZAI_API_KEY:-}"
+  if [[ -z "$key" ]]; then
+    [[ -t 0 ]] || die "no key available: export ZAI_API_KEY or run interactively"
+    read -rsp "Z.ai API key (Coding Plan key for plan quota): " key; echo
+  fi
+  [[ -n "$key" ]] || die "empty API key"
+  printf '%s' "$key"
+}
+
+# ---------- MCP helpers (read ~/.claude.json with jq; change it only via the `claude mcp` CLI) ----------
+
+have_cli() { command -v claude >/dev/null 2>&1; }
+
+mcp_registered() {
+  [[ -f "$CLAUDE_JSON" ]] && jq -e --arg n "$1" '(.mcpServers // {})[$n] != null' "$CLAUDE_JSON" >/dev/null 2>&1
+}
+
+# Z.ai's official definitions, used when no saved definition exists.
+mcp_default_def() {
+  local name="$1" key="$2"
+  case "$name" in
+    web-search-prime)
+      jq -nc --arg k "$key" '{type:"http",url:"https://api.z.ai/api/mcp/web_search_prime/mcp",headers:{Authorization:("Bearer "+$k)}}' ;;
+    web-reader)
+      jq -nc --arg k "$key" '{type:"http",url:"https://api.z.ai/api/mcp/web_reader/mcp",headers:{Authorization:("Bearer "+$k)}}' ;;
+    zread)
+      jq -nc --arg k "$key" '{type:"http",url:"https://api.z.ai/api/mcp/zread/mcp",headers:{Authorization:("Bearer "+$k)}}' ;;
+    zai-mcp-server)
+      jq -nc --arg k "$key" '{type:"stdio",command:"npx",args:["-y","@z_ai/mcp-server@latest"],env:{Z_AI_API_KEY:$k,Z_AI_MODE:"ZAI"}}' ;;
+  esac
+}
+
+mcp_remove_all() {
+  have_cli || return 0
+  local n removed=0
+  for n in "${MCP_NAMES[@]}"; do
+    if mcp_registered "$n"; then
+      if claude mcp remove "$n" -s user >/dev/null 2>&1; then
+        removed=$((removed + 1))
+      else
+        warn "could not remove MCP server $n"
+      fi
+    fi
+  done
+  info "Z.ai MCP servers removed: $removed"
+}
+
+mcp_save_and_remove() {
+  if ! have_cli; then warn "claude CLI not found; skipping MCP servers"; return 0; fi
+  local n found='{}'
+  for n in "${MCP_NAMES[@]}"; do
+    if mcp_registered "$n"; then
+      found=$(jq -c --arg n "$n" --slurpfile c "$CLAUDE_JSON" '. + {($n): $c[0].mcpServers[$n]}' <<<"$found")
+    fi
+  done
+  if [[ "$found" != '{}' ]]; then
+    mkdir -p "$STORE_DIR"; chmod 700 "$STORE_DIR"
+    if [[ -f "$MCP_STORE" ]]; then
+      jq -c -s '.[0] + .[1]' "$MCP_STORE" <(printf '%s' "$found") > "$MCP_STORE.tmp"
+    else
+      printf '%s\n' "$found" > "$MCP_STORE.tmp"
+    fi
+    chmod 600 "$MCP_STORE.tmp"; mv "$MCP_STORE.tmp" "$MCP_STORE"
+    info "Saved Z.ai MCP server definitions to $MCP_STORE"
+  fi
+  mcp_remove_all
+}
+
+mcp_restore() {
+  if ! have_cli; then warn "claude CLI not found; skipping MCP servers"; return 0; fi
+  local n def key added=0 present=0
+  key=$(jq -r '.ANTHROPIC_AUTH_TOKEN // empty' "$PROFILE")
+  for n in "${MCP_NAMES[@]}"; do
+    if mcp_registered "$n"; then present=$((present + 1)); continue; fi
+    def=""
+    if [[ -f "$MCP_STORE" ]]; then
+      def=$(jq -c --arg n "$n" '.[$n] // empty' "$MCP_STORE")
+    fi
+    [[ -n "$def" ]] || def=$(mcp_default_def "$n" "$key")
+    if claude mcp add-json -s user "$n" "$def" >/dev/null 2>&1; then
+      added=$((added + 1))
+    else
+      warn "could not add MCP server $n"
+    fi
+  done
+  info "Z.ai MCP servers added: $added (already present: $present)"
+}
+
+# ---------- commands ----------
+
+cmd_glm() {
+  local force=0 newkey=0 nomcp=0 changed=0 key
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      --new-key) newkey=1 ;;
+      --no-mcp) nomcp=1 ;;
+      *) die "unknown option: $a" ;;
+    esac
+  done
+
+  ensure_settings
+  local mode; mode=$(current_mode)
+  if [[ "$mode" == custom && $force -eq 0 ]]; then
+    die "settings.json uses a non-Z.ai ANTHROPIC_BASE_URL; not touching it (use --force to override)"
+  fi
+
+  mkdir -p "$STORE_DIR"; chmod 700 "$STORE_DIR"
+
+  if [[ $newkey -eq 1 ]]; then
+    key=$(read_key)
+    build_default_profile "$key" > "$PROFILE.tmp"
+    chmod 600 "$PROFILE.tmp"; mv "$PROFILE.tmp" "$PROFILE"
+    rm -f "$MCP_STORE"   # saved MCP definitions hold the old key
+    info "Saved GLM profile to $PROFILE"
+  elif [[ ! -f "$PROFILE" ]]; then
+    if [[ "$mode" == glm ]]; then
+      save_profile_from_settings
+    else
+      key=$(read_key)
+      build_default_profile "$key" > "$PROFILE.tmp"
+      chmod 600 "$PROFILE.tmp"; mv "$PROFILE.tmp" "$PROFILE"
+      info "Saved GLM profile to $PROFILE"
+    fi
+  fi
+
+  jq -e '.ANTHROPIC_AUTH_TOKEN and .ANTHROPIC_BASE_URL' "$PROFILE" >/dev/null \
+    || die "$PROFILE is missing the key or base URL; run: claude-switch glm --new-key"
+
+  if [[ "$mode" == glm && $newkey -eq 0 ]]; then
+    info "Already in GLM mode."
+  else
+    backup_settings
+    jq --slurpfile p "$PROFILE" '.env = ((.env // {}) + $p[0])' "$SETTINGS" | write_settings
+    info "Switched to Z.ai GLM API (https://api.z.ai/api/anthropic)."
+    changed=1
+  fi
+
+  if [[ $nomcp -eq 0 ]]; then
+    if [[ $newkey -eq 1 ]]; then mcp_remove_all; fi
+    mcp_restore
+  fi
+
+  warn_shell_env
+  if [[ $changed -eq 1 ]]; then remind_restart; fi
+}
+
+cmd_claude() {
+  local force=0 nomcp=0 changed=0
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      --no-mcp) nomcp=1 ;;
+      *) die "unknown option: $a" ;;
+    esac
+  done
+
+  ensure_settings
+  local mode; mode=$(current_mode)
+  if [[ "$mode" == custom && $force -eq 0 ]]; then
+    die "settings.json uses a non-Z.ai ANTHROPIC_BASE_URL; not touching it (use --force to override)"
+  fi
+
+  if [[ "$mode" == claude ]]; then
+    info "Already in Claude subscription mode."
+  else
+    backup_settings
+    # Save the current GLM block so switching back keeps your key and any tweaks.
+    if [[ "$mode" == glm ]]; then save_profile_from_settings; fi
+
+    # Remove only the GLM keys; leave every other setting alone.
+    jq --argjson keys "$KEYS_JSON" '
+      if .env then .env |= with_entries(select(.key as $k | ($keys | index($k)) | not)) else . end
+      | if (.env // {}) == {} then del(.env) else . end
+    ' "$SETTINGS" | write_settings
+
+    info "Switched to Claude subscription."
+    info "If Claude Code asks you to sign in, run 'claude' and use /login."
+    changed=1
+  fi
+
+  if [[ $nomcp -eq 0 ]]; then mcp_save_and_remove; fi
+
+  warn_shell_env
+  if [[ $changed -eq 1 ]]; then remind_restart; fi
+}
+
+cmd_status() {
+  ensure_settings
+  local mode; mode=$(current_mode)
+  case "$mode" in
+    glm)    echo "Mode:     Z.ai GLM API" ;;
+    claude) echo "Mode:     Claude subscription (no custom endpoint in settings.json)" ;;
+    custom) echo "Mode:     custom endpoint (not managed by this script)" ;;
+  esac
+  echo "Settings: $SETTINGS"
+  if [[ "$mode" != claude ]]; then
+    local base key opus haiku
+    base=$(jq -r '.env.ANTHROPIC_BASE_URL // "-"' "$SETTINGS")
+    key=$(jq -r '.env.ANTHROPIC_AUTH_TOKEN // ""' "$SETTINGS")
+    opus=$(jq -r '.env.ANTHROPIC_DEFAULT_OPUS_MODEL // "-"' "$SETTINGS")
+    haiku=$(jq -r '.env.ANTHROPIC_DEFAULT_HAIKU_MODEL // "-"' "$SETTINGS")
+    echo "Endpoint: $base"
+    echo "Models:   opus/sonnet=$opus  haiku=$haiku"
+    if [[ -n "$key" ]]; then echo "Key:      …${key: -4}"; fi
+  fi
+  local n reg=0 names=""
+  for n in "${MCP_NAMES[@]}"; do
+    if mcp_registered "$n"; then reg=$((reg + 1)); names+="$n "; fi
+  done
+  echo "Z.ai MCP: $reg/${#MCP_NAMES[@]} registered ${names:+($names)}"
+  if [[ -f "$PROFILE" ]]; then echo "Profile:  saved ($PROFILE)"; else echo "Profile:  none saved yet"; fi
+  if [[ -f "$MCP_STORE" ]]; then echo "MCP defs: saved ($MCP_STORE)"; else echo "MCP defs: none saved yet"; fi
+  warn_shell_env
+}
+
+case "${1:-}" in
+  glm)            shift; cmd_glm "$@" ;;
+  claude|sub|subscription) shift; cmd_claude "$@" ;;
+  status)         cmd_status ;;
+  -h|--help|help|"") usage ;;
+  *)              usage >&2; exit 1 ;;
+esac
